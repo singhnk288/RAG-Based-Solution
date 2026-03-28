@@ -17,6 +17,7 @@ from langchain_core.documents import Document
 import fitz  # PyMuPDF
 import docx
 from datetime import datetime
+import pytz
 
 def get_confluence_response(url):
     response = requests.get(
@@ -76,12 +77,7 @@ def get_all_pages():
     
     df = pd.DataFrame(all_pages)
 
-    df.to_csv("D:\\Coding\\GEN AI - Transformation\\Data-Extraction\\confluence_pages.csv", index=False)
-    
-
-
-BASE_URL = "https://develneeraj.atlassian.net/wiki"
-API_ENDPOINT = "/rest/api/content"
+    df.to_csv("D:\\Coding\\GEN AI - Transformation\\Data-Extraction\\confluence_pages.csv", index=False)    
 
 
 def clean_html(html_content):
@@ -168,7 +164,7 @@ def get_all_chuks_pages_from_confluence():
                     "space": page.get("space", {}).get("name"),
                     "space_key": page.get("space", {}).get("key"),
                     "labels": ",".join(labels),
-                    "url": f"{BASE_URL}/pages/{page_id}",
+                    "url": f"{const.CONFLUENCE_BASE_URL}/pages/{page_id}",
                     "word_count": len(clean_text_data.split()),
                     "summary": ""  # placeholder for future LLM summary
                 }
@@ -181,6 +177,21 @@ def get_all_chuks_pages_from_confluence():
     df.to_csv("D:\\Coding\\GEN AI - Transformation\\Data-Extraction\\confluence_pages_2.csv", index=False)
     return final_rows
 
+def to_utc(local_time_str: str, tz_name: str):
+    """
+    Convert a local time string to UTC.
+    local_time_str format: 'YYYY-MM-DD HH:MM'
+    tz_name: e.g. 'Asia/Kolkata', 'America/New_York'
+    """
+    # Parse the local time
+    local_tz = pytz.timezone(tz_name)
+    naive_dt = datetime.strptime(local_time_str, "%Y-%m-%d %H:%M:%S")
+    
+    # Localize and convert to UTC
+    local_dt = local_tz.localize(naive_dt)
+    utc_dt = local_dt.astimezone(pytz.utc)
+    
+    return utc_dt
 
 def extract_docx_content(doc_path: str):
     """
@@ -196,12 +207,16 @@ def extract_docx_content(doc_path: str):
     os.makedirs(image_dir, exist_ok=True)
 
     stat_info = os.stat(doc_path)
-    created_fs = datetime.fromtimestamp(stat_info.st_ctime)
+    created_fs = to_utc(datetime.fromtimestamp(stat_info.st_ctime).strftime("%Y-%m-%d %H:%M:%S"),"Asia/Kolkata")
     modified_fs = datetime.fromtimestamp(stat_info.st_mtime)
     filesize= stat_info.st_size
     # Extract text and images (images saved into image_dir if any)
     text = docx2txt.process(doc_path, image_dir)
-
+    
+    doc_meta = docx.Document(doc_path)
+    props = doc_meta.core_properties
+    created_date =props.created
+    author= props.author
     # Collect image paths only if directory has files
     images = []
     if os.path.exists(image_dir):
@@ -212,8 +227,10 @@ def extract_docx_content(doc_path: str):
         metadata={"source": doc_path, 
                   "images": images,
                   "created_date":str(created_fs) if created_fs else None,
+                  "utc_created_date":str(created_date),
                   "last_modified_date":str(modified_fs) if modified_fs else None,
-                  "filesize":filesize
+                  "filesize":filesize,
+                  'author':author
                   }
     )
 
@@ -246,3 +263,36 @@ def extract_pdf_content(pdf_path: str):
         metadata={"source": pdf_path, "images": images}
     )
 
+
+import psycopg2
+from pgvector.psycopg2 import register_vector
+from sentence_transformers import SentenceTransformer
+
+# Get this from Supabase → Settings → Database → Connection string
+conn = psycopg2.connect(f"postgresql://postgres:{const.SUPERBASE_DB_PASSWORD}@db.RAGBasedLearning.supabase.co:5432/postgres")
+register_vector(conn)
+
+model = SentenceTransformer("BAAI/bge-base-en-v1.5")  # 768 dims, runs on CPU fine
+
+def upsert_chunk(doc_id, source, title, url, content):
+    vector = model.encode(content, normalize_embeddings=True).tolist()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rag_chunks (doc_id, source, title, url, content, embedding)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (doc_id) DO UPDATE
+            SET content=EXCLUDED.content, embedding=EXCLUDED.embedding
+        """, (doc_id, source, title, url, content, vector))
+        conn.commit()
+
+def search(query, top_k=5):
+    qvec = model.encode(query, normalize_embeddings=True).tolist()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT doc_id, title, url, content,
+                   1 - (embedding <=> %s::vector) AS score
+            FROM rag_chunks
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """, (qvec, qvec, top_k))
+        return cur.fetchall()
